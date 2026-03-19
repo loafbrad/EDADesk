@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Bradley Boccuzzi
+With lots of help from Claude Code
 # Desk EDA & Partial Re-simulation
 # Vue 3 + TypeScript + Vite
 
