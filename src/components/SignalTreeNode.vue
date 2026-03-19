@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { TreeNode, Signal, SignalGroup, GridConfig, Marker, MarkerPlacementMode, SieveRegion, WavePoint } from '../types/waveform';
+import type { ViewportBounds } from '../composables/useViewport';
 import { isSignalReference, isSignalGroup } from '../types/waveform';
 import type { SieveState } from '../composables/useSieve';
 import SignalGroupHeader from './SignalGroupHeader.vue';
@@ -22,7 +23,7 @@ const props = withDefaults(defineProps<{
   waveformHeight?: number;
   regions?: SieveRegion[];
   isEditMode?: boolean;
-  editTool?: 'draw' | 'annotate' | 'select';
+  editTool?: 'draw' | 'select';
   getSievesForGroup?: (groupId: string) => SieveState[];
   isSieveDragging?: boolean;
   getEffectivePoints?: (signal: Signal, showOriginal?: boolean) => WavePoint[];
@@ -32,6 +33,8 @@ const props = withDefaults(defineProps<{
   selectionDragStartX?: number | null;
   selectionDragCurrentX?: number | null;
   selectionDragSignals?: string[];
+  viewportBounds?: ViewportBounds;
+  scrollLeft?: number;
 }>(), {
   markerPlacementMode: 'off',
   isDarkMode: false,
@@ -45,6 +48,8 @@ const props = withDefaults(defineProps<{
   selectionDragStartX: null,
   selectionDragCurrentX: null,
   selectionDragSignals: () => [],
+  viewportBounds: undefined,
+  scrollLeft: 0,
 });
 
 const emit = defineEmits<{
@@ -62,7 +67,6 @@ const emit = defineEmits<{
   (e: 'dragleave', nodeId: string): void;
   (e: 'drop', event: DragEvent, nodeId: string): void;
   (e: 'place-marker', x: number): void;
-  (e: 'create-highlight', startX: number, endX: number, signalId: string): void;
   (e: 'selection-start', startX: number, signalId: string): void;
   (e: 'selection-move', currentX: number, signalId: string): void;
   (e: 'selection-end', endX: number): void;
@@ -253,6 +257,8 @@ function handleDrop(event: DragEvent) {
         :selection-drag-start-x="selectionDragStartX"
         :selection-drag-current-x="selectionDragCurrentX"
         :selection-drag-signals="selectionDragSignals"
+        :viewport-bounds="viewportBounds"
+        :scroll-left="scrollLeft"
         @toggle-collapse="(id) => emit('toggle-collapse', id)"
         @rename-group="(id, name) => emit('rename-group', id, name)"
         @select-signal="(id) => emit('select-signal', id)"
@@ -267,7 +273,6 @@ function handleDrop(event: DragEvent) {
         @dragleave="(id) => emit('dragleave', id)"
         @drop="(e, id) => emit('drop', e, id)"
         @place-marker="(x) => emit('place-marker', x)"
-        @create-highlight="(startX, endX, signalId) => emit('create-highlight', startX, endX, signalId)"
         @selection-start="(startX, signalId) => emit('selection-start', startX, signalId)"
         @selection-move="(currentX, signalId) => emit('selection-move', currentX, signalId)"
         @selection-end="(endX) => emit('selection-end', endX)"
@@ -302,6 +307,8 @@ function handleDrop(event: DragEvent) {
       :selection-drag-start-x="selectionDragStartX"
       :selection-drag-current-x="selectionDragCurrentX"
       :selection-drag-signals="selectionDragSignals"
+      :viewport-bounds="viewportBounds"
+      :scroll-left="scrollLeft"
       @update:points="handleSignalUpdatePoints"
       @select="handleSignalSelect"
       @rename="handleSignalRename"
@@ -313,7 +320,6 @@ function handleDrop(event: DragEvent) {
       @dragleave="handleDragLeave"
       @drop="handleDrop"
       @place-marker="(x) => emit('place-marker', x)"
-      @create-highlight="(startX, endX) => emit('create-highlight', startX, endX, signal.id)"
       @selection-start="(startX) => emit('selection-start', startX, signal.id)"
       @selection-move="(currentX) => emit('selection-move', currentX, signal.id)"
       @selection-end="(endX) => emit('selection-end', endX)"
@@ -341,6 +347,8 @@ function handleDrop(event: DragEvent) {
       :selection-drag-start-x="selectionDragStartX"
       :selection-drag-current-x="selectionDragCurrentX"
       :selection-drag-signals="selectionDragSignals"
+      :viewport-bounds="viewportBounds"
+      :scroll-left="scrollLeft"
       @update:points="handleSignalUpdatePoints"
       @select="handleSignalSelect"
       @rename="handleSignalRename"
@@ -353,7 +361,6 @@ function handleDrop(event: DragEvent) {
       @dragleave="handleDragLeave"
       @drop="handleDrop"
       @place-marker="(x) => emit('place-marker', x)"
-      @create-highlight="(startX, endX) => emit('create-highlight', startX, endX, signal.id)"
       @selection-start="(startX) => emit('selection-start', startX, signal.id)"
       @selection-move="(currentX) => emit('selection-move', currentX, signal.id)"
       @selection-end="(endX) => emit('selection-end', endX)"

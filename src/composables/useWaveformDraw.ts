@@ -14,10 +14,17 @@ export function useWaveformDraw(
   canvas: HTMLCanvasElement,
   gridConfig: GridConfig,
   isDarkMode: boolean = false,
-  isEditMode: boolean = true
+  isEditMode: boolean = true,
+  renderOffset: number = 0
 ) {
   const ctx = canvas.getContext('2d')!;
-  const { gridToPixelX, levelToPixelY } = useGridSnap(gridConfig);
+  const { gridToPixelX: baseGridToPixelX, levelToPixelY } = useGridSnap(gridConfig);
+
+  // Wrap gridToPixelX to subtract render offset for viewport-based rendering
+  const gridToPixelX = (gridX: number): number => {
+    return baseGridToPixelX(gridX) - renderOffset;
+  };
+
   const padding = 2;
 
   // Colors based on dark mode
@@ -40,13 +47,19 @@ export function useWaveformDraw(
     ctx.strokeStyle = colors.gridLine;
     ctx.lineWidth = 1;
 
-    // Vertical grid lines (time divisions)
-    for (let i = 0; i <= gridConfig.columns; i++) {
+    // Calculate visible column range for efficient grid drawing
+    const startCol = Math.max(0, Math.floor(renderOffset / gridConfig.cellWidth));
+    const endCol = Math.min(gridConfig.columns, Math.ceil((renderOffset + canvas.width) / gridConfig.cellWidth) + 1);
+
+    // Vertical grid lines (time divisions) - only draw visible ones
+    for (let i = startCol; i <= endCol; i++) {
       const x = gridToPixelX(i);
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, canvas.height);
-      ctx.stroke();
+      if (x >= -1 && x <= canvas.width + 1) {  // Small margin for line width
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
     }
 
     // Horizontal lines for high and low levels (only in edit mode)
@@ -313,13 +326,19 @@ export function useWaveformDraw(
     ctx.strokeStyle = colors.gridLine;
     ctx.lineWidth = 1;
 
-    // Vertical grid lines (time divisions)
-    for (let i = 0; i <= gridConfig.columns; i++) {
+    // Calculate visible column range for efficient grid drawing
+    const startCol = Math.max(0, Math.floor(renderOffset / gridConfig.cellWidth));
+    const endCol = Math.min(gridConfig.columns, Math.ceil((renderOffset + canvas.width) / gridConfig.cellWidth) + 1);
+
+    // Vertical grid lines (time divisions) - only draw visible ones
+    for (let i = startCol; i <= endCol; i++) {
       const x = gridToPixelX(i);
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, canvas.height);
-      ctx.stroke();
+      if (x >= -1 && x <= canvas.width + 1) {  // Small margin for line width
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
     }
   }
 

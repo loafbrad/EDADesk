@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, watch, computed } from 'vue';
 import type { Signal, GridConfig, WavePoint, Marker, MarkerPlacementMode, SieveRegion } from '../types/waveform';
+import type { ViewportBounds } from '../composables/useViewport';
 import { useGridSnap } from '../composables/useGridSnap';
 import { useWaveformDraw } from '../composables/useWaveformDraw';
 import { useMarkers } from '../composables/useMarkers';
@@ -18,13 +19,15 @@ const props = withDefaults(defineProps<{
   waveformHeight?: number;
   regions?: SieveRegion[];
   isEditMode?: boolean;
-  editTool?: 'draw' | 'annotate' | 'select';
+  editTool?: 'draw' | 'select';
   effectivePoints?: WavePoint[];
   isModified?: boolean;
   isSelectionDragging?: boolean;
   selectionDragStartX?: number | null;
   selectionDragCurrentX?: number | null;
   selectionDragSignals?: string[];
+  viewportBounds?: ViewportBounds;
+  scrollLeft?: number;
 }>(), {
   depth: 0,
   isDragOver: false,
@@ -41,6 +44,8 @@ const props = withDefaults(defineProps<{
   selectionDragStartX: null,
   selectionDragCurrentX: null,
   selectionDragSignals: () => [],
+  viewportBounds: undefined,
+  scrollLeft: 0,
 });
 
 // Use effectivePoints if provided, otherwise use signal.points
@@ -58,7 +63,6 @@ const emit = defineEmits<{
   (e: 'dragleave'): void;
   (e: 'drop', event: DragEvent): void;
   (e: 'place-marker', x: number): void;
-  (e: 'create-highlight', startX: number, endX: number): void;
   (e: 'selection-start', startX: number): void;
   (e: 'selection-move', currentX: number): void;
   (e: 'selection-end', endX: number): void;
@@ -72,11 +76,6 @@ const isEditing = ref(false);
 const editName = ref(props.signal.name);
 const isDragging = ref(false);
 const lastDragX = ref<number | null>(null);
-
-// Annotate dragging state
-const isAnnotateDragging = ref(false);
-const annotateStartX = ref<number | null>(null);
-const annotateEndX = ref<number | null>(null);
 
 // Selection dragging state
 const isSelectDragging = ref(false);
@@ -100,17 +99,76 @@ const tooltipVisible = ref(false);
 const tooltipText = ref('');
 const tooltipPosition = ref({ x: 0, y: 0 });
 
-const canvasWidth = computed(() => props.gridConfig.cellWidth * props.gridConfig.columns);
+// Full canvas width (for scrollbar/spacer)
+const fullCanvasWidth = computed(() => props.gridConfig.cellWidth * props.gridConfig.columns);
 const canvasHeight = computed(() => props.waveformHeight);
 const labelWidth = 120;
+
+// Viewport-aware canvas sizing
+const useViewportRendering = computed(() => props.viewportBounds !== undefined);
+const renderOffset = computed(() => props.viewportBounds?.renderOffset ?? 0);
+const visibleStartColumn = computed(() => props.viewportBounds?.startColumn ?? 0);
+const visibleEndColumn = computed(() => props.viewportBounds?.endColumn ?? props.gridConfig.columns);
+
+// Canvas width - use viewport-based sizing if available, otherwise full width
+const canvasWidth = computed(() => {
+  if (useViewportRendering.value && props.viewportBounds) {
+    const { startColumn, endColumn } = props.viewportBounds;
+    return (endColumn - startColumn) * props.gridConfig.cellWidth;
+  }
+  return fullCanvasWidth.value;
+});
+
+// Filter points to visible range for efficient rendering
+const visiblePoints = computed(() => {
+  const points = displayPoints.value;
+  if (!useViewportRendering.value || points.length === 0) {
+    return points;
+  }
+
+  // Sort points by x position
+  const sortedPoints = [...points].sort((a, b) => a.x - b.x);
+
+  // Find first point at or after visible start (include one before for entering line)
+  let startIndex = 0;
+  for (let i = 0; i < sortedPoints.length; i++) {
+    if (sortedPoints[i]!.x >= visibleStartColumn.value) {
+      startIndex = Math.max(0, i - 1);
+      break;
+    }
+    startIndex = i;
+  }
+
+  // Find all points up to visible end (include one after for exiting line)
+  const visiblePts: WavePoint[] = [];
+  for (let i = startIndex; i < sortedPoints.length; i++) {
+    const point = sortedPoints[i]!;
+    visiblePts.push(point);
+    if (point.x > visibleEndColumn.value) {
+      break;
+    }
+  }
+
+  return visiblePts;
+});
 
 const indentStyle = computed(() => ({
   paddingLeft: `${props.depth * 20 + 12}px`,
 }));
 
 const rowStyle = computed(() => ({
-  minWidth: `${labelWidth + canvasWidth.value + 4}px`, // +4 for border
+  minWidth: `${labelWidth + fullCanvasWidth.value + 4}px`, // +4 for border
 }));
+
+// Canvas transform for viewport positioning
+const canvasStyle = computed(() => {
+  if (useViewportRendering.value) {
+    return {
+      transform: `translateX(${renderOffset.value}px)`,
+    };
+  }
+  return {};
+});
 
 const canvasCursor = computed(() => {
   if (!props.isEditMode) {
@@ -119,7 +177,7 @@ const canvasCursor = computed(() => {
   if (props.markerPlacementMode !== 'off') {
     return 'copy';
   }
-  if (props.editTool === 'annotate' || props.editTool === 'select') {
+  if (props.editTool === 'select') {
     return 'text';  // Text cursor indicates selection
   }
   return 'crosshair';
@@ -165,14 +223,14 @@ onMounted(() => {
   if (canvasRef.value) {
     canvasRef.value.width = canvasWidth.value;
     canvasRef.value.height = canvasHeight.value;
-    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode);
+    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode, renderOffset.value);
     render();
   }
 });
 
-watch(() => [displayPoints.value, props.gridConfig, props.isSelected, props.markers, props.isDarkMode, props.regions, props.isEditMode, props.effectivePoints, props.isSelectionDragging, props.selectionDragCurrentX, props.selectionDragSignals], () => {
+watch(() => [displayPoints.value, props.gridConfig, props.isSelected, props.markers, props.isDarkMode, props.regions, props.isEditMode, props.effectivePoints, props.isSelectionDragging, props.selectionDragCurrentX, props.selectionDragSignals, props.viewportBounds], () => {
   if (canvasRef.value) {
-    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode);
+    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode, renderOffset.value);
   }
   render();
 }, { deep: true });
@@ -180,7 +238,7 @@ watch(() => [displayPoints.value, props.gridConfig, props.isSelected, props.mark
 watch(canvasWidth, (newWidth) => {
   if (canvasRef.value) {
     canvasRef.value.width = newWidth;
-    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode);
+    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode, renderOffset.value);
     render();
   }
 });
@@ -188,7 +246,7 @@ watch(canvasWidth, (newWidth) => {
 watch(canvasHeight, (newHeight) => {
   if (canvasRef.value) {
     canvasRef.value.height = newHeight;
-    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode);
+    drawFunctions = useWaveformDraw(canvasRef.value, props.gridConfig, props.isDarkMode, props.isEditMode, renderOffset.value);
     render();
   }
 });
@@ -200,20 +258,8 @@ function render() {
     // Use marker preview when in marker placement mode
     const showMarkerPreview = props.isEditMode && props.markerPlacementMode !== 'off' && markerPreviewX.value !== null;
 
-    // Include annotate preview region if we're dragging an annotation
-    let regionsWithPreview = props.regions;
-    if (isAnnotateDragging.value && annotateStartX.value !== null && annotateEndX.value !== null) {
-      const previewRegion = {
-        id: 'annotate-preview',
-        startX: Math.min(annotateStartX.value, annotateEndX.value),
-        endX: Math.max(annotateStartX.value, annotateEndX.value),
-        color: 'rgba(255, 235, 59, 0.4)',  // Yellow preview for annotate
-        signalId: props.signal.id,
-      };
-      regionsWithPreview = [...props.regions, previewRegion];
-    }
-
     // Include local selection preview region if we're dragging a selection in this row
+    let regionsWithPreview = props.regions;
     if (isSelectDragging.value && selectStartX.value !== null && selectEndX.value !== null) {
       const previewRegion = {
         id: 'select-preview',
@@ -239,9 +285,12 @@ function render() {
       regionsWithPreview = [...regionsWithPreview, previewRegion];
     }
 
+    // Use visiblePoints for efficient viewport rendering
+    const pointsToRender = visiblePoints.value;
+
     if (showWaveformPreview) {
       drawFunctions.renderWithPreview(
-        displayPoints.value,
+        pointsToRender,
         props.signal.color,
         props.markers,
         regionsWithPreview,
@@ -253,7 +302,7 @@ function render() {
       );
     } else if (showMarkerPreview) {
       drawFunctions.renderWithMarkerPreview(
-        displayPoints.value,
+        pointsToRender,
         props.signal.color,
         props.markers,
         regionsWithPreview,
@@ -263,7 +312,7 @@ function render() {
       );
     } else {
       drawFunctions.renderWithMarkersAndRegions(
-        displayPoints.value,
+        pointsToRender,
         props.signal.color,
         props.markers,
         regionsWithPreview,
@@ -277,8 +326,9 @@ function render() {
 function getCanvasPosition(e: MouseEvent): { x: number; y: number } {
   const canvas = canvasRef.value!;
   const rect = canvas.getBoundingClientRect();
+  // Add renderOffset to convert canvas-relative x to absolute x
   return {
-    x: e.clientX - rect.left,
+    x: e.clientX - rect.left + renderOffset.value,
     y: e.clientY - rect.top,
   };
 }
@@ -312,16 +362,6 @@ function handleMouseDown(e: MouseEvent) {
     }
 
     emit('place-marker', markerX);
-    return;
-  }
-
-  // Handle annotate mode
-  if (props.editTool === 'annotate') {
-    const gridX = snapX(x);
-    isAnnotateDragging.value = true;
-    annotateStartX.value = gridX;
-    annotateEndX.value = gridX;
-    render();
     return;
   }
 
@@ -460,16 +500,6 @@ function handleMouseMove(e: MouseEvent) {
     }
   }
 
-  // Handle annotate dragging
-  if (props.isEditMode && props.editTool === 'annotate' && isAnnotateDragging.value) {
-    const snappedX = snapX(x);
-    if (annotateEndX.value !== snappedX) {
-      annotateEndX.value = snappedX;
-      render();
-    }
-    return;
-  }
-
   // Handle selection dragging (local drag within this row)
   if (props.isEditMode && props.editTool === 'select' && isSelectDragging.value) {
     const snappedX = snapX(x);
@@ -524,19 +554,6 @@ function handleMouseMove(e: MouseEvent) {
 }
 
 function handleMouseUp() {
-  // Finalize annotation if we were dragging one
-  if (isAnnotateDragging.value && annotateStartX.value !== null && annotateEndX.value !== null) {
-    // Only create annotation if there's an actual range
-    if (annotateStartX.value !== annotateEndX.value) {
-      emit('create-highlight', annotateStartX.value, annotateEndX.value);
-    }
-    isAnnotateDragging.value = false;
-    annotateStartX.value = null;
-    annotateEndX.value = null;
-    render();
-    return;
-  }
-
   // Finalize selection if we were dragging one
   if (isSelectDragging.value && selectStartX.value !== null && selectEndX.value !== null) {
     // Emit selection-end with the final X position
@@ -566,11 +583,6 @@ function handleMouseLeave() {
   // Reset drag state
   isDragging.value = false;
   lastDragX.value = null;
-
-  // Reset annotate drag state
-  isAnnotateDragging.value = false;
-  annotateStartX.value = null;
-  annotateEndX.value = null;
 
   // Reset selection drag state
   isSelectDragging.value = false;
@@ -649,7 +661,9 @@ function handleKeydown(e: KeyboardEvent) {
         &times;
       </button>
     </div>
-    <div class="canvas-container">
+    <div class="canvas-container" :style="{ width: fullCanvasWidth + 'px' }">
+      <!-- Spacer div to maintain full scrollable width -->
+      <div v-if="useViewportRendering" class="canvas-spacer" :style="{ width: fullCanvasWidth + 'px' }"></div>
       <canvas
         ref="canvasRef"
         @mousedown="handleMouseDown"
@@ -658,7 +672,7 @@ function handleKeydown(e: KeyboardEvent) {
         @mouseleave="handleMouseLeave"
         @wheel="handleWheel"
         class="waveform-canvas"
-        :style="{ cursor: canvasCursor }"
+        :style="{ cursor: canvasCursor, ...canvasStyle }"
       />
       <div
         v-if="tooltipVisible"
@@ -801,6 +815,14 @@ function handleKeydown(e: KeyboardEvent) {
 
 .waveform-canvas {
   display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.canvas-spacer {
+  height: 1px;
+  visibility: hidden;
 }
 
 .region-tooltip {

@@ -7,12 +7,38 @@ import SignalBrowser from './SignalBrowser.vue';
 import ContextMenu from './ContextMenu.vue';
 import type { MenuItem } from './ContextMenu.vue';
 import { useVCD } from '../composables/useVCD';
+import { useSimulation } from '../composables/useSimulation';
 import { useSignalTree } from '../composables/useSignalTree';
 import { useDragDrop } from '../composables/useDragDrop';
 import { useMarkers } from '../composables/useMarkers';
 import { useSieve } from '../composables/useSieve';
+import { useViewport } from '../composables/useViewport';
 
 const { downloadVCD, parseVCD } = useVCD();
+const {
+  simulators,
+  selectedSimulator,
+  topModule,
+  currentProject,
+  isConnected: simConnected,
+  isCompiling,
+  isSimulating,
+  compileOutput,
+  simulationOutput,
+  simulatedSignals,
+  error: simError,
+  availableSimulators,
+  canCompile,
+  canSimulate,
+  init: initSimulation,
+  createProject,
+  uploadFiles,
+  compile,
+  simulate,
+  stopSimulation,
+  clearError: clearSimError,
+  clearOutput: clearSimOutput,
+} = useSimulation();
 const {
   sieves,
   sieveTransactions,
@@ -77,11 +103,13 @@ function createSignal(name?: string, width: number = 1, displayFormat: DisplayFo
 
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const sieveInputRef = ref<HTMLInputElement | null>(null);
+const verilogInputRef = ref<HTMLInputElement | null>(null);
+const simulationPanelExpanded = ref(true);
 const vectorBitWidth = ref(8);
 const clockPeriod = ref(2);
 const waveformHeight = ref(30); // Default height in pixels
 const isEditMode = ref(true); // Toggle between edit mode and view-only mode
-const editTool = ref<'draw' | 'annotate' | 'select'>('draw'); // Current editing tool
+const editTool = ref<'draw' | 'select'>('draw'); // Current editing tool
 
 // Selection state for copy/paste
 interface SelectionState {
@@ -109,6 +137,16 @@ const gridConfig = reactive<GridConfig>({
   cellHeight: 60,
   columns: 20,
 });
+
+// Viewport management for efficient rendering
+const signalsContainerRef = ref<HTMLElement | null>(null);
+const gridConfigRef = computed(() => gridConfig);
+const {
+  scrollLeft,
+  viewportBounds,
+  handleScroll: handleViewportScroll,
+  updateViewportWidth,
+} = useViewport(gridConfigRef);
 
 const signals = ref<Signal[]>([createSignal('CLK'), createSignal('DATA', 8)]);
 const selectedSignalId = ref<string | null>(signals.value[0]?.id || null);
@@ -140,32 +178,6 @@ const { state: dragState, startDrag, endDrag, handleDragOver, handleDragLeave, g
 const { markers, addMarkersFromEdges, addMarker, clearAllMarkers, getNextMarkerColor } = useMarkers();
 const markerPlacementMode = ref<MarkerPlacementMode>('off');
 
-// User-created highlight regions (separate from sieve regions)
-const userHighlights = ref<SieveRegion[]>([]);
-let highlightIdCounter = 0;
-
-function addUserHighlight(startX: number, endX: number, signalId?: string) {
-  const colors = [
-    'rgba(255, 235, 59, 0.3)',  // Yellow
-    'rgba(76, 175, 80, 0.3)',   // Green
-    'rgba(33, 150, 243, 0.3)',  // Blue
-    'rgba(156, 39, 176, 0.3)',  // Purple
-    'rgba(255, 152, 0, 0.3)',   // Orange
-  ];
-  const color = colors[userHighlights.value.length % colors.length];
-
-  userHighlights.value.push({
-    id: `highlight_${++highlightIdCounter}`,
-    startX: Math.min(startX, endX),
-    endX: Math.max(startX, endX),
-    color,
-    signalId,
-  });
-}
-
-function clearUserHighlights() {
-  userHighlights.value = [];
-}
 
 // Selection functions for copy/paste
 function startSelectionDrag(startX: number, signalId: string) {
@@ -381,13 +393,33 @@ function handleKeyDown(e: KeyboardEvent) {
   }
 }
 
+// ResizeObserver for viewport tracking
+let resizeObserver: ResizeObserver | null = null;
+
 onMounted(() => {
   initializeTree();
+  initSimulation();
   window.addEventListener('keydown', handleKeyDown);
+
+  // Set up viewport tracking
+  if (signalsContainerRef.value) {
+    updateViewportWidth(signalsContainerRef.value.clientWidth);
+
+    resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        updateViewportWidth(entry.contentRect.width);
+      }
+    });
+    resizeObserver.observe(signalsContainerRef.value);
+  }
 });
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeyDown);
+  if (resizeObserver) {
+    resizeObserver.disconnect();
+    resizeObserver = null;
+  }
 });
 
 // Sync tree when signals change externally (e.g., VCD load)
@@ -970,7 +1002,7 @@ const scopedSieveRegions = computed(() => {
 
 // Combined regions: sieve regions + user highlights + selection region
 const allRegions = computed(() => {
-  const regions = [...scopedSieveRegions.value, ...userHighlights.value];
+  const regions = [...scopedSieveRegions.value];
 
   // Add selection preview during drag (handled in SignalRow/VectorSignalRow for better reactivity)
   // This is intentionally empty - the preview is rendered directly in each signal row component
@@ -1219,6 +1251,63 @@ function handleToggleSieve(id: string, enabled: boolean) {
   }
 }
 
+// Simulation functions
+function triggerUploadVerilog() {
+  verilogInputRef.value?.click();
+}
+
+async function handleVerilogUpload(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = input.files;
+  if (!files || files.length === 0) return;
+
+  await uploadFiles(files);
+
+  // Reset file input
+  input.value = '';
+}
+
+async function handleCompile() {
+  await compile();
+}
+
+async function handleSimulate() {
+  await simulate();
+}
+
+async function handleStopSimulation() {
+  await stopSimulation();
+}
+
+function addSimulatedSignalsToDisplay() {
+  // Add simulated signals to the main signals array
+  for (const simSignal of simulatedSignals.value) {
+    // Check if signal already exists (by name)
+    const existingIndex = signals.value.findIndex(s => s.name === simSignal.name);
+    if (existingIndex >= 0) {
+      // Update existing signal's points
+      signals.value[existingIndex] = {
+        ...signals.value[existingIndex]!,
+        points: [...simSignal.points],
+      };
+    } else {
+      // Add new signal
+      signals.value.push({ ...simSignal });
+      addSignalReference(simSignal.id);
+    }
+  }
+
+  // Expand grid if needed
+  const maxTime = simulatedSignals.value.reduce((max, s) => {
+    const sigMax = s.points.reduce((m, p) => Math.max(m, p.x), 0);
+    return Math.max(max, sigMax);
+  }, 0);
+
+  if (maxTime > gridConfig.columns) {
+    gridConfig.columns = maxTime + 5;
+  }
+}
+
 // Helper to format transaction data values
 // Supports both number and bigint for large bit widths
 function formatTransactionValue(value: number | bigint, format: DisplayFormat, width: number = 8): string {
@@ -1314,6 +1403,15 @@ watch(
       @change="handleSieveLoad"
     />
 
+    <input
+      type="file"
+      ref="verilogInputRef"
+      accept=".v,.sv,.vh,.svh"
+      multiple
+      style="display: none"
+      @change="handleVerilogUpload"
+    />
+
     <div class="toolbar">
       <button
         @click="isEditMode = !isEditMode"
@@ -1330,12 +1428,6 @@ watch(
           :class="{ active: editTool === 'draw' }"
           title="Draw waveform points"
         >Draw</button>
-        <button
-          @click="editTool = 'annotate'"
-          class="tool-btn"
-          :class="{ active: editTool === 'annotate' }"
-          title="Annotate regions"
-        >Annotate</button>
         <button
           @click="editTool = 'select'; selection = null"
           class="tool-btn"
@@ -1439,7 +1531,7 @@ watch(
       @clear-available="clearAvailableSignals"
     />
 
-    <div class="signals-container">
+    <div ref="signalsContainerRef" class="signals-container" @scroll="handleViewportScroll">
       <div v-if="tree.length === 0 && availableSignals.length === 0" class="empty-state">
         No signals. Use the + button below to create one, or load a VCD file.
       </div>
@@ -1473,6 +1565,8 @@ watch(
         :selection-drag-start-x="selectionDragStartX"
         :selection-drag-current-x="selectionDragCurrentX"
         :selection-drag-signals="selectionDragSignals"
+        :viewport-bounds="viewportBounds"
+        :scroll-left="scrollLeft"
         @toggle-collapse="toggleCollapse"
         @rename-group="renameGroup"
         @select-signal="(id) => selectedSignalId = id"
@@ -1487,7 +1581,6 @@ watch(
         @dragleave="handleTreeDragLeave"
         @drop="handleTreeDrop"
         @place-marker="handlePlaceMarker"
-        @create-highlight="(startX, endX, signalId) => addUserHighlight(startX, endX, signalId)"
         @selection-start="(startX, signalId) => startSelectionDrag(startX, signalId)"
         @selection-move="(currentX, signalId) => updateSelectionDrag(currentX, signalId)"
         @selection-end="(endX) => endSelectionDrag(endX)"
@@ -1529,6 +1622,135 @@ watch(
       :items="contextMenu.items"
       @close="closeContextMenu"
     />
+
+    <!-- Simulation Panel -->
+    <div class="simulation-panel" :class="{ 'dark-mode': isDarkMode }">
+      <div class="sim-header" @click="simulationPanelExpanded = !simulationPanelExpanded">
+        <h3>
+          <span class="expand-icon">{{ simulationPanelExpanded ? '&#9660;' : '&#9654;' }}</span>
+          Simulation
+        </h3>
+        <div class="sim-status">
+          <span v-if="!simConnected" class="status-badge disconnected">Disconnected</span>
+          <span v-else-if="isCompiling" class="status-badge compiling">Compiling...</span>
+          <span v-else-if="isSimulating" class="status-badge simulating">Running...</span>
+          <span v-else class="status-badge connected">Ready</span>
+        </div>
+      </div>
+
+      <div v-if="simulationPanelExpanded" class="sim-content">
+        <!-- Simulator Selection -->
+        <div class="sim-row">
+          <label>Simulator:</label>
+          <select v-model="selectedSimulator" :disabled="isCompiling || isSimulating" class="sim-select">
+            <option v-for="sim in availableSimulators" :key="sim.id" :value="sim.id">
+              {{ sim.name }} {{ sim.version ? `(${sim.version})` : '' }}
+            </option>
+          </select>
+        </div>
+
+        <!-- Top Module Selection -->
+        <div class="sim-row">
+          <label>Top Module:</label>
+          <input
+            v-model="topModule"
+            type="text"
+            class="sim-input"
+            placeholder="Auto-detect from file"
+            :disabled="isCompiling || isSimulating"
+          />
+          <select
+            v-if="currentProject && currentProject.files.length > 0"
+            @change="(e) => { const v = (e.target as HTMLSelectElement).value; if (v) topModule = v.replace('.v', '').replace('.sv', ''); }"
+            class="sim-select-small"
+            :disabled="isCompiling || isSimulating"
+          >
+            <option value="">From file...</option>
+            <option v-for="file in currentProject.files" :key="file" :value="file">
+              {{ file }}
+            </option>
+          </select>
+        </div>
+
+        <!-- Project Files -->
+        <div class="sim-row">
+          <label>Files:</label>
+          <div class="files-info">
+            <span v-if="currentProject && currentProject.files.length > 0">
+              {{ currentProject.files.length }} file(s): {{ currentProject.files.join(', ') }}
+            </span>
+            <span v-else class="no-files">No files uploaded</span>
+          </div>
+          <button @click="triggerUploadVerilog" class="btn btn-small" :disabled="isCompiling || isSimulating">
+            Upload Verilog
+          </button>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="sim-actions">
+          <button
+            @click="handleCompile"
+            class="btn btn-compile"
+            :disabled="!canCompile"
+          >
+            Compile
+          </button>
+          <button
+            v-if="!isSimulating"
+            @click="handleSimulate"
+            class="btn btn-simulate"
+            :disabled="!canSimulate"
+          >
+            Simulate
+          </button>
+          <button
+            v-else
+            @click="handleStopSimulation"
+            class="btn btn-stop"
+          >
+            Stop
+          </button>
+          <button
+            v-if="simulatedSignals.length > 0"
+            @click="addSimulatedSignalsToDisplay"
+            class="btn btn-add-signals"
+          >
+            Add to Waveform ({{ simulatedSignals.length }})
+          </button>
+        </div>
+
+        <!-- Error Display -->
+        <div v-if="simError" class="sim-error">
+          <span>{{ simError }}</span>
+          <button @click="clearSimError" class="btn-dismiss">&times;</button>
+        </div>
+
+        <!-- Output Console -->
+        <div v-if="compileOutput.length > 0 || simulationOutput.length > 0" class="sim-console">
+          <div class="console-header">
+            <span>Output</span>
+            <button @click="clearSimOutput" class="btn-clear">Clear</button>
+          </div>
+          <div class="console-output">
+            <div v-for="(line, i) in compileOutput" :key="'c' + i" class="console-line">{{ line }}</div>
+            <div v-for="(line, i) in simulationOutput" :key="'s' + i" class="console-line sim-line">{{ line }}</div>
+          </div>
+        </div>
+
+        <!-- Simulated Signals Preview -->
+        <div v-if="simulatedSignals.length > 0" class="sim-signals-preview">
+          <div class="preview-header">Simulated Signals ({{ simulatedSignals.length }})</div>
+          <div class="preview-list">
+            <div v-for="sig in simulatedSignals" :key="sig.id" class="preview-signal">
+              <span class="sig-color" :style="{ background: sig.color }"></span>
+              <span class="sig-name">{{ sig.name }}</span>
+              <span class="sig-width">[{{ sig.width - 1 }}:0]</span>
+              <span class="sig-points">{{ sig.points.length }} pts</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- Sieve Panel -->
     <div class="sieve-panel">
@@ -2830,5 +3052,440 @@ watch(
 .dark-mode .stat-badge.region {
   background: rgba(76, 175, 80, 0.2);
   color: #81c784;
+}
+
+/* Simulation Panel Styles */
+.simulation-panel {
+  margin-top: 20px;
+  padding: 16px;
+  background: #e3f2fd;
+  border: 1px solid #90caf9;
+  border-radius: 8px;
+}
+
+.sim-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.sim-header h3 {
+  margin: 0;
+  font-size: 16px;
+  color: #1565c0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.expand-icon {
+  font-size: 10px;
+  width: 12px;
+}
+
+.sim-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-badge {
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.status-badge.connected {
+  background: #c8e6c9;
+  color: #2e7d32;
+}
+
+.status-badge.disconnected {
+  background: #ffcdd2;
+  color: #c62828;
+}
+
+.status-badge.compiling {
+  background: #fff3e0;
+  color: #e65100;
+}
+
+.status-badge.simulating {
+  background: #e3f2fd;
+  color: #1565c0;
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.sim-content {
+  margin-top: 16px;
+}
+
+.sim-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.sim-row label {
+  min-width: 70px;
+  font-size: 14px;
+  color: #1565c0;
+  font-weight: 500;
+}
+
+.sim-select {
+  flex: 1;
+  max-width: 250px;
+  padding: 6px 10px;
+  border: 1px solid #90caf9;
+  border-radius: 4px;
+  background: white;
+  font-size: 14px;
+}
+
+.sim-select-small {
+  padding: 6px 8px;
+  border: 1px solid #90caf9;
+  border-radius: 4px;
+  background: white;
+  font-size: 13px;
+  max-width: 150px;
+}
+
+.sim-input {
+  flex: 1;
+  max-width: 200px;
+  padding: 6px 10px;
+  border: 1px solid #90caf9;
+  border-radius: 4px;
+  background: white;
+  font-size: 14px;
+  font-family: monospace;
+}
+
+.sim-input::placeholder {
+  color: #90a4ae;
+  font-style: italic;
+  font-family: inherit;
+}
+
+.files-info {
+  flex: 1;
+  font-size: 13px;
+  color: #333;
+  font-family: monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.no-files {
+  color: #888;
+  font-style: italic;
+}
+
+.sim-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #90caf9;
+}
+
+.btn-compile {
+  background: #1565c0;
+  color: white;
+}
+
+.btn-compile:hover:not(:disabled) {
+  background: #0d47a1;
+}
+
+.btn-simulate {
+  background: #2e7d32;
+  color: white;
+}
+
+.btn-simulate:hover:not(:disabled) {
+  background: #1b5e20;
+}
+
+.btn-stop {
+  background: #c62828;
+  color: white;
+}
+
+.btn-stop:hover {
+  background: #b71c1c;
+}
+
+.btn-add-signals {
+  background: #7b1fa2;
+  color: white;
+}
+
+.btn-add-signals:hover {
+  background: #6a1b9a;
+}
+
+.btn-small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.sim-error {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #ffebee;
+  border: 1px solid #ef9a9a;
+  border-radius: 4px;
+  color: #c62828;
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.btn-dismiss {
+  background: none;
+  border: none;
+  color: #c62828;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.sim-console {
+  margin-top: 12px;
+  border: 1px solid #90caf9;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.console-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  background: #bbdefb;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1565c0;
+}
+
+.btn-clear {
+  background: none;
+  border: none;
+  color: #1565c0;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.console-output {
+  max-height: 150px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  background: #fafafa;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.console-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #333;
+}
+
+.console-line.sim-line {
+  color: #2e7d32;
+}
+
+.sim-signals-preview {
+  margin-top: 12px;
+  border: 1px solid #90caf9;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.preview-header {
+  padding: 6px 10px;
+  background: #bbdefb;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1565c0;
+}
+
+.preview-list {
+  max-height: 120px;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.preview-signal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.sig-color {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.sig-name {
+  font-weight: 500;
+  color: #333;
+}
+
+.sig-width {
+  color: #666;
+  font-family: monospace;
+}
+
+.sig-points {
+  margin-left: auto;
+  color: #888;
+  font-size: 11px;
+}
+
+/* Dark mode simulation panel */
+.simulation-panel.dark-mode {
+  background: #1a237e;
+  border-color: #3949ab;
+}
+
+.simulation-panel.dark-mode .sim-header h3 {
+  color: #90caf9;
+}
+
+.simulation-panel.dark-mode .sim-row label {
+  color: #90caf9;
+}
+
+.simulation-panel.dark-mode .sim-select {
+  background: #283593;
+  border-color: #3949ab;
+  color: #e0e0e0;
+}
+
+.simulation-panel.dark-mode .sim-select-small {
+  background: #283593;
+  border-color: #3949ab;
+  color: #e0e0e0;
+}
+
+.simulation-panel.dark-mode .sim-input {
+  background: #283593;
+  border-color: #3949ab;
+  color: #e0e0e0;
+}
+
+.simulation-panel.dark-mode .sim-input::placeholder {
+  color: #7986cb;
+}
+
+.simulation-panel.dark-mode .files-info {
+  color: #e0e0e0;
+}
+
+.simulation-panel.dark-mode .no-files {
+  color: #666;
+}
+
+.simulation-panel.dark-mode .sim-actions {
+  border-top-color: #3949ab;
+}
+
+.simulation-panel.dark-mode .sim-error {
+  background: #3e2723;
+  border-color: #5d4037;
+  color: #ef9a9a;
+}
+
+.simulation-panel.dark-mode .btn-dismiss {
+  color: #ef9a9a;
+}
+
+.simulation-panel.dark-mode .sim-console {
+  border-color: #3949ab;
+}
+
+.simulation-panel.dark-mode .console-header {
+  background: #283593;
+  color: #90caf9;
+}
+
+.simulation-panel.dark-mode .btn-clear {
+  color: #90caf9;
+}
+
+.simulation-panel.dark-mode .console-output {
+  background: #1a1a2e;
+}
+
+.simulation-panel.dark-mode .console-line {
+  color: #e0e0e0;
+}
+
+.simulation-panel.dark-mode .console-line.sim-line {
+  color: #81c784;
+}
+
+.simulation-panel.dark-mode .sim-signals-preview {
+  border-color: #3949ab;
+}
+
+.simulation-panel.dark-mode .preview-header {
+  background: #283593;
+  color: #90caf9;
+}
+
+.simulation-panel.dark-mode .preview-list {
+  background: #1a1a2e;
+}
+
+.simulation-panel.dark-mode .sig-name {
+  color: #e0e0e0;
+}
+
+.simulation-panel.dark-mode .sig-width {
+  color: #888;
+}
+
+.simulation-panel.dark-mode .sig-points {
+  color: #666;
+}
+
+.simulation-panel.dark-mode .status-badge.connected {
+  background: rgba(76, 175, 80, 0.2);
+  color: #81c784;
+}
+
+.simulation-panel.dark-mode .status-badge.disconnected {
+  background: rgba(244, 67, 54, 0.2);
+  color: #ef9a9a;
+}
+
+.simulation-panel.dark-mode .status-badge.compiling {
+  background: rgba(255, 152, 0, 0.2);
+  color: #ffb74d;
+}
+
+.simulation-panel.dark-mode .status-badge.simulating {
+  background: rgba(33, 150, 243, 0.2);
+  color: #64b5f6;
 }
 </style>
